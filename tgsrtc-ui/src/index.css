@@ -14,8 +14,7 @@ html, body, #root {
 
 body {
   font-family: 'Inter', system-ui, sans-serif;
-  background-color: #f0f9ff; /* sky-50 */
-  color: #0f172a;
+  @apply bg-sky-50 dark:bg-slate-950 text-slate-800 dark:text-slate-100 transition-colors duration-300;
   -webkit-font-smoothing: antialiased;
 }
 
