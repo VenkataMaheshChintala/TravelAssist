@@ -172,7 +172,7 @@ public class BusService {
 
         List<Map<String, Object>> tripInfos = jdbc.queryForList(tripInfoSql, tripParams.toArray());
 
-        List<String> stops = new ArrayList<>();
+        List<Map<String, Object>> stops = new ArrayList<>();
         if (!tripInfos.isEmpty()) {
             Map<String, Object> info = tripInfos.get(0);
             String tripId = (String) info.get("trip_id");
@@ -180,7 +180,7 @@ public class BusService {
             int dstSeq = (Integer) info.get("dst_seq");
 
             String stopsSql =
-                "SELECT s.stop_name " +
+                "SELECT s.stop_name, s.stop_lat, s.stop_lon " +
                 "FROM stop_times st " +
                 "JOIN stops s ON s.stop_id = st.stop_id " +
                 "WHERE st.trip_id = ? " +
@@ -188,7 +188,7 @@ public class BusService {
                 "  AND st.stop_sequence <= ? " +
                 "ORDER BY st.stop_sequence ASC";
 
-            stops = jdbc.queryForList(stopsSql, String.class, tripId, srcSeq, dstSeq);
+            stops = jdbc.queryForList(stopsSql, tripId, srcSeq, dstSeq);
         }
 
         Map<String, Object> result = new LinkedHashMap<>();
@@ -201,11 +201,6 @@ public class BusService {
     // Connecting-route search using BFS over adjacency data from the DB
     // -------------------------------------------------------------------------
 
-    /**
-     * BFS over the transit graph (built from stop_times) to find a connecting
-     * path when no direct bus exists. Tries all matching source stop IDs and
-     * returns the shortest path found.
-     */
     public List<String> findConnectingRoute(String startName, String endName) {
         List<String> startIds = findStopIdsByName(startName);
         List<String> endIds   = findStopIdsByName(endName);
@@ -215,77 +210,79 @@ public class BusService {
         }
 
         Set<String> endIdSet = new HashSet<>(endIds);
-
-        // Load adjacency list from the database once (stop → next stops via bus)
         Map<String, List<Connection>> adjacency = buildAdjacencyList();
 
         List<String> bestPath = null;
+        int bestTransfers = Integer.MAX_VALUE;
 
         for (String startId : startIds) {
-            Queue<String> queue = new LinkedList<>();
-            Map<String, String> parentTracker = new HashMap<>();
-            Map<String, String> busTracker    = new HashMap<>();
+            PriorityQueue<Node> pq = new PriorityQueue<>();
+            Map<String, Integer> minCostToState = new HashMap<>(); // stateKey -> cost
 
-            queue.add(startId);
-            parentTracker.put(startId, null);
+            pq.add(new Node(startId, "", 0, 0, null));
+            minCostToState.put(startId + "|", 0);
 
-            while (!queue.isEmpty()) {
-                String current = queue.poll();
+            while (!pq.isEmpty()) {
+                Node current = pq.poll();
 
-                if (endIdSet.contains(current)) {
-                    List<String> path = reconstructPath(current, parentTracker, busTracker);
-                    if (bestPath == null || path.size() < bestPath.size()) {
-                        bestPath = path;
+                if (endIdSet.contains(current.stopId)) {
+                    if (bestPath == null || current.transfers < bestTransfers) {
+                        bestPath = reconstructDijkstraPath(current);
+                        bestTransfers = current.transfers;
                     }
                     break;
                 }
 
-                List<Connection> neighbours = adjacency.getOrDefault(current, Collections.emptyList());
+                List<Connection> neighbours = adjacency.getOrDefault(current.stopId, Collections.emptyList());
                 for (Connection conn : neighbours) {
-                    if (!parentTracker.containsKey(conn.toStopId)) {
-                        parentTracker.put(conn.toStopId, current);
-                        busTracker.put(conn.toStopId, conn.busNumber);
-                        queue.add(conn.toStopId);
+                    boolean isTransfer = !current.busNumber.isEmpty() && !current.busNumber.equals(conn.busNumber);
+                    int newTransfers = current.transfers + (isTransfer ? 1 : 0);
+                    int newHops = current.hops + 1;
+
+                    // Limit to max 2 transfers for realistic transit routes
+                    if (newTransfers > 2) continue;
+
+                    int cost = newTransfers * 10000 + newHops;
+                    String stateKey = conn.toStopId + "|" + conn.busNumber;
+
+                    if (cost < minCostToState.getOrDefault(stateKey, Integer.MAX_VALUE)) {
+                        minCostToState.put(stateKey, cost);
+                        pq.add(new Node(conn.toStopId, conn.busNumber, newHops, newTransfers, current));
                     }
                 }
             }
         }
 
-        return bestPath != null ? bestPath : Collections.singletonList("No route found.");
+        return bestPath != null ? bestPath : Collections.singletonList("No connecting route found.");
     }
 
     // -------------------------------------------------------------------------
     // Stop name → ID resolution (handles multiple stops with same name)
     // -------------------------------------------------------------------------
 
-    /**
-     * Returns ALL stop IDs matching the given name.
-     * Exact matches take priority; partial (ILIKE) matches used as fallback.
-     */
     private List<String> findStopIdsByName(String name) {
         String trimmed = name.trim();
-
-        // Exact match (case-insensitive)
         List<String> exact = jdbc.queryForList(
             "SELECT stop_id FROM stops WHERE LOWER(stop_name) = LOWER(?)",
             String.class, trimmed
         );
-        if (!exact.isEmpty()) {
-            System.out.println("DEBUG findStopIdsByName: exact for '" + trimmed + "' -> " + exact);
-            return exact;
-        }
+        if (!exact.isEmpty()) return exact;
 
-        // Partial match
-        List<String> partial = jdbc.queryForList(
+        return jdbc.queryForList(
             "SELECT stop_id FROM stops WHERE stop_name ILIKE ?",
             String.class, "%" + trimmed + "%"
         );
-        System.out.println("DEBUG findStopIdsByName: partial for '" + trimmed + "' -> " + partial);
-        return partial;
+    }
+
+    private String stopName(String stopId) {
+        List<String> names = jdbc.queryForList(
+            "SELECT stop_name FROM stops WHERE stop_id = ?", String.class, stopId
+        );
+        return names.isEmpty() ? stopId : names.get(0);
     }
 
     // -------------------------------------------------------------------------
-    // Graph building (loaded on-demand for BFS)
+    // Graph building
     // -------------------------------------------------------------------------
 
     private static class Connection {
@@ -297,12 +294,7 @@ public class BusService {
         }
     }
 
-    /**
-     * Builds a stop-level adjacency list from consecutive stop_times rows.
-     * Only consecutive stops within the same trip are connected.
-     */
     private Map<String, List<Connection>> buildAdjacencyList() {
-        // Fetch ordered stop_times with route short name in one query
         String sql =
             "SELECT st.trip_id, st.stop_id, st.stop_sequence, r.route_short_name " +
             "FROM stop_times st " +
@@ -310,7 +302,6 @@ public class BusService {
             "JOIN routes r ON r.route_id = t.route_id " +
             "ORDER BY st.trip_id, st.stop_sequence";
 
-        // Group by trip_id
         Map<String, List<Object[]>> byTrip = new LinkedHashMap<>();
         jdbc.query(sql, rs -> {
             String tripId    = rs.getString("trip_id");
@@ -334,31 +325,66 @@ public class BusService {
         return adjacency;
     }
 
+    private static class Node implements Comparable<Node> {
+        String stopId;
+        String busNumber;
+        int hops;
+        int transfers;
+        Node parent;
+
+        Node(String stopId, String busNumber, int hops, int transfers, Node parent) {
+            this.stopId = stopId;
+            this.busNumber = busNumber;
+            this.hops = hops;
+            this.transfers = transfers;
+            this.parent = parent;
+        }
+
+        @Override
+        public int compareTo(Node other) {
+            if (this.transfers != other.transfers) {
+                return Integer.compare(this.transfers, other.transfers);
+            }
+            return Integer.compare(this.hops, other.hops);
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Path reconstruction
     // -------------------------------------------------------------------------
 
-    private List<String> reconstructPath(String endId,
-                                         Map<String, String> parents,
-                                         Map<String, String> buses) {
+    private List<String> reconstructDijkstraPath(Node endNode) {
         List<String> directions = new ArrayList<>();
-        String current = endId;
-        while (parents.get(current) != null) {
-            String prev    = parents.get(current);
-            String bus     = buses.get(current);
-            String prevName    = stopName(prev);
-            String currentName = stopName(current);
-            directions.add(0, "At " + prevName + ", board Bus " + bus + " → Get off at " + currentName);
-            current = prev;
+        List<Node> path = new ArrayList<>();
+        
+        Node curr = endNode;
+        while (curr != null) {
+            if (curr.parent != null) { 
+                path.add(curr);
+            }
+            curr = curr.parent;
         }
-        return directions;
-    }
+        Collections.reverse(path);
+        
+        if (path.isEmpty()) return directions;
 
-    private String stopName(String stopId) {
-        List<String> names = jdbc.queryForList(
-            "SELECT stop_name FROM stops WHERE stop_id = ?", String.class, stopId
-        );
-        return names.isEmpty() ? stopId : names.get(0);
+        String currentBus = path.get(0).busNumber;
+        String boardStopId = path.get(0).parent.stopId;
+        
+        for (int i = 0; i < path.size(); i++) {
+            Node n = path.get(i);
+            if (!n.busNumber.equals(currentBus)) {
+                String alightStopId = path.get(i - 1).stopId;
+                directions.add("At " + stopName(boardStopId) + ", board Bus " + currentBus + " → Get off at " + stopName(alightStopId));
+                currentBus = n.busNumber;
+                boardStopId = alightStopId;
+            }
+        }
+        
+        String finalStopId = path.get(path.size() - 1).stopId;
+        directions.add("At " + stopName(boardStopId) + ", board Bus " + currentBus + " → Get off at " + stopName(finalStopId));
+
+        return directions;
     }
 
     // -------------------------------------------------------------------------

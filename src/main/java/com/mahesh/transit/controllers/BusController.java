@@ -4,6 +4,7 @@ import com.mahesh.transit.services.BusService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.http.HttpStatus;
 
 import java.util.List;
 import java.util.Map;
@@ -43,9 +44,14 @@ public class BusController {
         return ResponseEntity.ok(busService.getRouteDetails(bus, source, destination, time));
     }
 
-    /** Health-check endpoint — useful for verifying the backend is up */
     @GetMapping("/health")
     public ResponseEntity<Map<String, String>> health() {
         return ResponseEntity.ok(Map.of("status", "ok", "service", "TGSRTC"));
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<Map<String, String>> handleException(Exception e) {
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(Map.of("error", e.getClass().getName(), "message", e.getMessage() != null ? e.getMessage() : "null"));
     }
 }
